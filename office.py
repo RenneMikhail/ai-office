@@ -87,10 +87,31 @@ def ask(agent_id, prompt):
 # ---- События для браузера (SSE) -----------------------------------------------
 listeners, lock, busy = [], threading.Lock(), threading.Event()
 
+event_log, event_cond = [], threading.Condition()  # для зрителей через туннель (SSE там не работает)
+event_seq = [0]
+
 def emit(**ev):
     with lock:
         for q in listeners:
             q.put(ev)
+    with event_cond:
+        event_seq[0] += 1
+        event_log.append((event_seq[0], ev))
+        del event_log[:-300]
+        event_cond.notify_all()
+
+def snapshot():
+    return ([{"type": "activity", "agent": k, "active": v} for k, v in activity.items()]
+            + [{"type": "presence", "agent": k, "here": bool(t), "token": t or ""} for k, t in presence.items()])
+
+def poll(since):
+    """Long polling: отдать события новее since (или снимок состояния при since < 0)."""
+    with event_cond:
+        if since < 0:
+            return {"id": event_seq[0], "events": snapshot()}
+        if event_seq[0] <= since:
+            event_cond.wait(timeout=8)
+        return {"id": event_seq[0], "events": [e for i, e in event_log if i > since]}
 
 def run_task(task):
     try:
@@ -407,6 +428,13 @@ class H(BaseHTTPRequestHandler):
                 pass
             finally:
                 with lock: listeners.remove(q)
+        elif route == "/poll":
+            q = dict(p.partition("=")[::2] for p in self.path.partition("?")[2].split("&") if p)
+            try:
+                since = int(q.get("since", "-1"))
+            except ValueError:
+                since = -1
+            self.reply(200, json.dumps(poll(since)), "application/json")
         elif route == "/agents":
             self.reply(200, json.dumps({k: {"name": v["name"], "role": v["role"]}
                                         for k, v in AGENTS.items()}), "application/json")
@@ -704,17 +732,26 @@ function sync(id,delay=0){const p=P[id],want=conn&&p.here;
   else if(!want&&p.in){p.in=false;leave(p,delay)}}
 function syncAll(){order.forEach((id,i)=>sync(id,i*900));
   setTimeout(()=>{$('banner').style.display=(!conn)?'flex':'none'},conn?0:4500)}
-const es=new EventSource('/events'+Q);
-es.onopen=()=>{conn=true;$('banner').style.display='none';syncAll()};
-es.onerror=()=>{if(!conn)return;conn=false;q.length=0;$('go').disabled=false;syncAll()};
-es.onmessage=m=>{const e=JSON.parse(m.data);
+function onOpen(){conn=true;$('banner').style.display='none';syncAll()}
+function onLost(){if(!conn)return;conn=false;q.length=0;$('go').disabled=false;syncAll()}
+function onEvent(e){
   if(e.type==='leave'){conn=false;q.length=0;syncAll()}
   else if(e.type==='activity')P[e.agent].ext=e.active;
   else if(e.type==='presence'){const p=P[e.agent],restart=p.here&&e.here&&p.tok!==e.token&&p.in;
     p.here=e.here;p.tok=e.token;
     if(restart){log('Перезапуск: '+names[e.agent].name);p.in=false;leave(p,0).then(()=>{if(conn&&p.here&&!p.in){p.in=true;p.pw=false;enter(p,500)}})}
     else sync(e.agent)}
-  else{q.push(e);pump()}};
+  else{q.push(e);pump()}}
+if(VIEWER){ // через туннель SSE не работает — обычные запросы с ожиданием
+  (async()=>{let id=-1;for(;;){try{
+    const r=await fetch('/poll?since='+id+(KEY?'&key='+encodeURIComponent(KEY):''));
+    if(!r.ok)throw new Error(r.status);const d=await r.json();
+    if(id<0)onOpen();id=d.id;d.events.forEach(onEvent)
+  }catch(err){onLost();id=-1;await sleep(3000)}}})();
+}else{
+  const es=new EventSource('/events'+Q);
+  es.onopen=onOpen;es.onerror=onLost;es.onmessage=m=>onEvent(JSON.parse(m.data));
+}
 async function send(){const t=$('task').value.trim();if(!t||!conn)return;
   const r=await fetch('/task',{method:'POST',body:JSON.stringify({task:t})});
   if(r.ok){$('go').disabled=true;log('ЗАДАЧА: '+t);$('task').value=''}}
