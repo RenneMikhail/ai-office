@@ -102,6 +102,7 @@ def emit(**ev):
 
 def snapshot():
     return ([{"type": "activity", "agent": k, "active": v} for k, v in activity.items()]
+            + [{"type": "detail", "agent": k, "text": v} for k, v in details.items()]
             + [{"type": "presence", "agent": k, "here": bool(t), "token": t or ""} for k, t in presence.items()])
 
 def poll(since):
@@ -133,6 +134,98 @@ def run_task(task):
 
 # Реальная активность моделей (вне зависимости от того, откуда пришла задача)
 activity = {"claude_app": False, "claude": False, "qwen": False, "deepseek": False}
+details = dict.fromkeys(activity, "")  # что агент делает прямо сейчас (короткая реплика для пузыря)
+
+def brief(t, n=120):
+    t = " ".join(str(t).split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+def describe_tool(name, args):
+    """Название инструмента + безопасные детали (имя файла, домен). Сами команды не показываем."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {}
+    args = args if isinstance(args, dict) else {}
+    n = str(name or "").lower()
+    if n.startswith("mcp__"):  # внешние инструменты: показываем понятное действие, а не техническое имя
+        srv = n.split("__")[1] if n.count("__") >= 2 else ""
+        if "browser" in srv or "chrome" in srv:
+            return "смотрю в браузере"
+        if "terminal" in srv:
+            return "работаю в терминале"
+        if "computer" in srv:
+            return "работаю с экраном"
+        if srv.startswith("ccd") or "session" in srv:
+            return "управляю приложением"
+        return "использую инструмент"
+    path = args.get("file_path") or args.get("absolute_path") or args.get("path") or ""
+    fname = os.path.basename(str(path)) if path else ""
+    if "shell" in n or n == "bash":
+        return brief(args.get("description") or "запускаю команду", 90)
+    if "search" in n and ("web" in n or "internet" in n):
+        return "ищу в интернете"
+    if "fetch" in n or n.startswith("web"):
+        host = re.sub(r"^https?://([^/]+).*$", r"\1", str(args.get("url") or ""))
+        return "открываю страницу " + host if host else "открываю страницу"
+    if "read" in n or "list" in n:
+        return "читаю " + (fname or "файлы")
+    if any(k in n for k in ("edit", "write", "replace")):
+        return "пишу " + (fname or "файл")
+    if any(k in n for k in ("grep", "glob", "search", "find")):
+        return "ищу в файлах"
+    if any(k in n for k in ("task", "agent")):
+        return "зову помощника"
+    if "todo" in n:
+        return "веду план работ"
+    if "message" in n:
+        return "пишу сообщение"
+    return brief(name or "работаю", 40)
+
+def last_action(rows, text_of, tool_of):
+    """Последнее действие модели по журналу: реплика (текст) или инструмент."""
+    last = next((r for r in reversed(rows) if r.get("type") in ("user", "assistant", "tool_result")), None)
+    if last is None:
+        return ""
+    if last["type"] == "user" and text_of(last):
+        return "читаю задачу"
+    for r in reversed(rows):
+        if r.get("type") == "assistant":
+            t, tool = text_of(r), tool_of(r)
+            if tool:
+                return tool
+            if t:
+                return brief(t)
+            return "думаю"
+    return ""
+
+def _claude_parts(r):
+    c = (r.get("message") or {}).get("content")
+    return c if isinstance(c, list) else []
+
+def claude_text(r):
+    return " ".join(b.get("text", "") for b in _claude_parts(r) if isinstance(b, dict) and b.get("type") == "text").strip()
+
+def claude_tool(r):
+    for b in reversed(_claude_parts(r)):
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            return describe_tool(b.get("name"), b.get("input"))
+    return ""
+
+def _qwen_parts(r):
+    p = (r.get("message") or {}).get("parts")
+    return p if isinstance(p, list) else []
+
+def qwen_text(r):
+    return " ".join(str(p.get("text", "")) for p in _qwen_parts(r) if isinstance(p, dict) and "text" in p and not p.get("thought")).strip()
+
+def qwen_tool(r):
+    for p in reversed(_qwen_parts(r)):
+        if isinstance(p, dict) and "functionCall" in p:
+            fc = p["functionCall"] or {}
+            return describe_tool(fc.get("name"), fc.get("args"))
+    return ""
 LMS = os.path.expanduser("~/.lmstudio/bin/lms")
 CLAUDE_LOGS = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 
@@ -182,7 +275,7 @@ def dsh_busy():
     """Читает ТОЛЬКО типы событий журналов DeepSeek Harness (turn/start, turn/end, tool/call).
     Возвращает True, если в какой-то сессии сейчас идёт ход. Заодно замечает, когда DeepSeek
     запускает/зовёт Claude (по свежим вызовам инструментов)."""
-    busy, now = False, time.time()
+    busy, now, detail, newest = False, time.time(), "", 0
     for p in glob.glob(DSH_SESSIONS):
         try:
             mt = os.path.getmtime(p)
@@ -198,26 +291,33 @@ def dsh_busy():
             except Exception:
                 continue  # файл дописывается в этот момент — попробуем в следующий раз
             fresh = st is not None  # при первом чтении истории звонки не считаем
-            st = st or {"n": 0, "open": False}
+            st = st or {"n": 0, "open": False, "detail": ""}
             for line in lines[st["n"]:]:
                 try:
                     kind = json.loads(line).get("type")
                 except ValueError:
                     continue
                 if kind == "turn/start":
-                    st["open"] = True
+                    st["open"], st["detail"] = True, "думаю"
                 elif kind == "turn/end":
-                    st["open"] = False
-                elif kind == "tool/call" and fresh and CLAUDE_CALL.search(line):
+                    st["open"], st["detail"] = False, ""
+                elif kind == "tool/call":
+                    d = (json.loads(line).get("data") or {})
+                    st["detail"] = describe_tool(d.get("name"), d.get("arguments"))
+                if kind == "tool/call" and fresh and CLAUDE_CALL.search(line):
                     dsh_called_claude.append(now)
             st["n"], st["mt"] = len(lines), mt
             _dsh_files[p] = st
-        busy = busy or (st["open"] and now - mt < 600)
-    return busy
+        if st["open"] and now - mt < 600:
+            busy = True
+            if mt >= newest:
+                newest, detail = mt, st.get("detail", "")
+    return busy, detail
 
 def probe():
     """Возвращает (кто сейчас занят, кто в сети: токен процесса или None)."""
     act = dict.fromkeys(activity, False)
+    det = {}
     lms_out = ""
     try:  # Qwen: LM Studio показывает статус модели (IDLE / не IDLE)
         lms_out = subprocess.run([LMS, "ps"], capture_output=True, text=True, timeout=4).stdout
@@ -225,10 +325,13 @@ def probe():
             w = line.split()
             if "qwen" in line.lower() and len(w) > 2 and w[2].upper() != "IDLE":
                 act["qwen"] = True
+                det["qwen"] = "генерирую ответ"
     except Exception:
         pass
     try:  # Qwen Code в терминале (отдельно от LM Studio)
-        act["qwen"] = act["qwen"] or qwen_code_busy()
+        code_busy, code_det = qwen_code_state()
+        if code_busy:
+            act["qwen"], det["qwen"] = True, code_det or det.get("qwen", "")
     except Exception:
         pass
     try:  # Claude: в свежем журнале сессии последний ход не завершён (нет end_turn)
@@ -244,12 +347,14 @@ def probe():
                 done = last["type"] == "assistant" and last["message"].get("stop_reason") in (
                     "end_turn", "stop_sequence", "max_tokens")
                 act["claude"] = not done
+                if act["claude"]:
+                    det["claude"] = last_action(rows, claude_text, claude_tool)
     except Exception:
         pass
     procs = processes()
     try:  # DeepSeek Harness: по журналам сессий; без zstd — по загрузке процессора
         if zstd:
-            act["deepseek"] = dsh_busy()
+            act["deepseek"], det["deepseek"] = dsh_busy()
         else:
             total = sum(c for _, c, a in procs if "DeepSeek Harness.app" in a)
             now = time.time()
@@ -270,6 +375,8 @@ def probe():
                     or ("api" if AGENTS["deepseek"]["key"] else None)
                     or ("lms" if "deepseek" in lms_out.lower() else None),
     }
+    for k in details:
+        details[k] = det.get(k, "") if act[k] else ""
     return act, here  # DeepSeek через API: занятость локально не видна
 
 presence = dict.fromkeys(activity)  # agent -> токен запущенной программы или None
@@ -290,12 +397,12 @@ def claude_code_from_harness(procs, seen):
 
 QWEN_CHATS = os.path.expanduser("~/.qwen/projects/*/chats/*.jsonl")
 
-def qwen_code_busy():
-    """Qwen Code (терминал): ход идёт, если последнее сообщение журнала — не финальный текст модели."""
+def qwen_code_state():
+    """Qwen Code (терминал): (идёт ли ход, что делает). Ход идёт, если последнее сообщение — не финальный текст."""
     files = glob.glob(QWEN_CHATS)
     newest = max(files, key=os.path.getmtime, default=None)
     if not newest or time.time() - os.path.getmtime(newest) > 300:
-        return False
+        return False, ""
     with open(newest, "rb") as f:
         f.seek(0, 2)
         f.seek(max(0, f.tell() - 200_000))
@@ -307,11 +414,10 @@ def qwen_code_busy():
                 pass
     last = next((r for r in reversed(rows) if r.get("type") in ("user", "assistant", "tool_result")), None)
     if not last:
-        return False
-    if last["type"] != "assistant":
-        return True  # пришёл запрос или результат инструмента — модель сейчас думает
-    parts = (last.get("message") or {}).get("parts") or []
-    return any(isinstance(p, dict) and "functionCall" in p for p in parts)  # вызвала инструмент — ход продолжается
+        return False, ""
+    busy_now = last["type"] != "assistant" or any(
+        isinstance(p, dict) and "functionCall" in p for p in _qwen_parts(last))
+    return busy_now, (last_action(rows, qwen_text, qwen_tool) if busy_now else "")
 
 def is_qwen_code(a):
     return "node" in a and a.split()[-1].endswith("/qwen")
@@ -341,6 +447,7 @@ def monitor():
     misses = dict.fromkeys(activity, 0)
     seen = dict.fromkeys(activity, (None, 0))
     handed = False
+    shown = {}
     cc_seen = None
     last_hand = {}
     while True:
@@ -349,6 +456,10 @@ def monitor():
             if activity[k] != v:
                 activity[k] = v
                 emit(type="activity", agent=k, active=v)
+        for k, v in details.items():
+            if shown.get(k) != v:
+                shown[k] = v
+                emit(type="detail", agent=k, text=v)
         spawned, cc_seen = claude_code_from_harness(processes(), cc_seen)
         if dsh_called_claude or spawned:  # DeepSeek запустил/позвал Claude Code -> передача задачи
             dsh_called_claude.clear()
@@ -417,6 +528,7 @@ class H(BaseHTTPRequestHandler):
                 self.chunk(b": hi " + b" " * 2048 + b"\n\n")  # «пробивает» буферы прокси
                 for k, v in activity.items():
                     q.put({"type": "activity", "agent": k, "active": v})
+                    q.put({"type": "detail", "agent": k, "text": details[k]})
                 for k, tok in presence.items():
                     q.put({"type": "presence", "agent": k, "here": bool(tok), "token": tok or ""})
                 while True:
@@ -477,16 +589,16 @@ button{padding:10px 18px;border:0;border-radius:8px;background:#f5b942;font-weig
 button:disabled{opacity:.5}
 #view{flex:1;position:relative;overflow:hidden;min-height:0}
 #view canvas{display:block}
-#log{height:120px;margin:8px 10px 10px;padding:10px;background:#1e2129;border-radius:8px;overflow:auto;font-size:13px;white-space:pre-wrap}
-.bubble{position:absolute;pointer-events:none;max-width:250px;background:#fff;color:#222;border:2.5px solid #222;
- border-radius:14px;padding:8px 12px;font:14px/1.3 -apple-system,sans-serif;transform:translate(-50%,-100%);display:none}
+#log{height:max(150px,22vh);margin:8px 10px 10px;padding:10px;background:#1e2129;border-radius:8px;overflow:auto;font-size:15px;line-height:1.4;white-space:pre-wrap}
+.bubble{position:absolute;pointer-events:none;max-width:min(360px,74vw);background:#fff;color:#222;border:3px solid #222;
+ border-radius:16px;padding:10px 15px;font:600 17px/1.35 -apple-system,sans-serif;overflow-wrap:anywhere;transform:translate(-50%,-100%);display:none}
 .bubble:before,.bubble:after{content:'';position:absolute;left:50%;border:solid transparent}
-.bubble:before{bottom:-21px;margin-left:-10px;border-width:10px;border-top-color:#222}
-.bubble:after{bottom:-15px;margin-left:-8px;border-width:8px;border-top-color:#fff}
+.bubble:before{bottom:-24px;margin-left:-12px;border-width:12px;border-top-color:#222}
+.bubble:after{bottom:-17px;margin-left:-9px;border-width:9px;border-top-color:#fff}
 .tag{position:absolute;pointer-events:none;transform:translate(-50%,-100%);text-align:center;color:#fff;
- padding:4px 12px;border-radius:10px;border:2px solid rgba(0,0,0,.55);box-shadow:0 2px 6px rgba(0,0,0,.35);font-size:12px;line-height:1.25}
-.tag b{display:block;font-size:16px}.tag.off{filter:grayscale(1);opacity:.7}
-.bubble.think{border-radius:28px;font-style:italic}
+ padding:2px 7px;border-radius:7px;border:1.5px solid rgba(0,0,0,.5);box-shadow:0 1px 4px rgba(0,0,0,.3);font-size:9.5px;line-height:1.15;opacity:.92;white-space:nowrap}
+.tag b{display:block;font-size:11.5px}.tag.off{filter:grayscale(1);opacity:.55}
+.bubble.think{border-radius:26px;font-style:italic;font-weight:500}
 #banner{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
  font-size:28px;font-weight:700;background:rgba(20,22,30,.55);pointer-events:none;text-align:center}
 #hint{position:absolute;right:12px;top:8px;font-size:12px;opacity:.7}
@@ -632,7 +744,7 @@ function makePerson(id){
     j[k]={up,fo,hip,sh};
     if(k==='r'){const p=M(new THREE.BoxGeometry(.24,.01,.32),0xffffff,fo,0,-.34,.12);p.visible=false;j.paper=p}
   }
-  return Object.assign(j,{pose:Object.fromEntries(KEYS.map(k=>[k,0])),mode:'stand',ph:0,moving:false,yawT:0,job:0,carry:false,seated:false,bubble:null,kind:'',pw:false,ext:false,in:false,here:false,tok:''});
+  return Object.assign(j,{pose:Object.fromEntries(KEYS.map(k=>[k,0])),mode:'stand',ph:0,moving:false,yawT:0,job:0,carry:false,seated:false,bubble:null,kind:'',pw:false,ext:false,detail:'',in:false,here:false,tok:''});
 }
 const P={};order.forEach(id=>P[id]=makePerson(id));
 
@@ -656,7 +768,10 @@ function poseFor(p,t){
 let DT=.016;const angD=(a,b)=>{let d=(b-a)%(Math.PI*2);if(d>Math.PI)d-=Math.PI*2;if(d<-Math.PI)d+=Math.PI*2;return d};
 function updPerson(p,t){
   if(p.seated){p.mode=(p.pw||p.ext)?'work':'rest';
-    if(p.ext&&!p.pw&&!p.text)say(p,'Работаю','think');else if(p.kind==='think'&&!p.pw&&!p.ext)say(p,'')}
+    const working=p.pw||p.ext;
+    if(working&&(!p.text||p.kind==='work'||p.kind==='think')){const want=p.detail||(p.pw?'Хмм':'Работаю');
+      if(p.text!==want||p.kind!=='work')say(p,want,'work')}
+    else if(!working&&(p.kind==='work'||p.kind==='think'))say(p,'')}
   const tg=poseFor(p,t),k=1-Math.exp(-DT*8);
   for(const key of KEYS)p.pose[key]+=(tg[key]-p.pose[key])*k;
   const s=p.pose;p.pelvis.position.set(0,s.py,s.pz);p.torso.rotation.x=s.tx;p.neck.rotation.x=s.hx;
@@ -694,14 +809,14 @@ async function leave(p,delay){const id=++p.job;try{
 for(const id of order){const b=document.createElement('div');b.className='bubble';view.appendChild(b);P[id].bubble=b;
   const t=document.createElement('div');t.className='tag';t.style.background='#'+COL[id].toString(16).padStart(6,'0');
   t.innerHTML='<b>'+names[id].name+'</b><span></span>';view.appendChild(t);P[id].tag=t}
-function say(p,text,kind='say'){p.text=text;p.kind=kind;p.bubble.className='bubble'+(kind==='think'?' think':'');p.bubble.style.display=text?'block':'none'}
-const short=t=>{t=t.replace(/\s+/g,' ');return t.length>130?t.slice(0,127)+'…':t};
+function say(p,text,kind='say'){p.text=text;p.kind=kind;p.bubble.className='bubble'+(kind==='think'||kind==='work'?' think':'');p.bubble.style.display=text?'block':'none'}
+const short=t=>{t=t.replace(/\s+/g,' ');return t.length>230?t.slice(0,227)+'…':t};
 const _v=new THREE.Vector3();
 function placeBubbles(t){const W=view.clientWidth,H=view.clientHeight;
   order.forEach((id,i)=>{const p=P[id];_v.set(DX[id],1.75+(i%2)*.5,-3.0).project(cam);
     p.tag.style.left=((_v.x*.5+.5)*W)+'px';p.tag.style.top=((-_v.y*.5+.5)*H)+'px';
     const st=!p.in?'не запущен':(p.mode==='work'?'работает':'отдыхает');
-    p.tag.classList.toggle('off',!p.in);p.tag.lastChild.textContent=names[id].role+' · '+st});
+    p.tag.classList.toggle('off',!p.in);p.tag.lastChild.textContent=st});
   for(const id of order){const p=P[id];if(!p.text||!p.root.visible){p.bubble.style.display='none';continue}
     p.bubble.style.display='block';
     if(p.kind==='think')p.bubble.textContent=p.text+'.'.repeat(1+Math.floor(t*2.5)%3);else p.bubble.textContent=p.text;
@@ -737,6 +852,7 @@ function onLost(){if(!conn)return;conn=false;q.length=0;$('go').disabled=false;s
 function onEvent(e){
   if(e.type==='leave'){conn=false;q.length=0;syncAll()}
   else if(e.type==='activity')P[e.agent].ext=e.active;
+  else if(e.type==='detail')P[e.agent].detail=e.text;
   else if(e.type==='presence'){const p=P[e.agent],restart=p.here&&e.here&&p.tok!==e.token&&p.in;
     p.here=e.here;p.tok=e.token;
     if(restart){log('Перезапуск: '+names[e.agent].name);p.in=false;leave(p,0).then(()=>{if(conn&&p.here&&!p.in){p.in=true;p.pw=false;enter(p,500)}})}
