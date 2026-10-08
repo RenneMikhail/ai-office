@@ -493,7 +493,10 @@ renderer.domElement.onpointerdown=e=>{drag=[e.clientX,e.clientY]};
 addEventListener('pointerup',()=>drag=null);
 addEventListener('pointermove',e=>{if(!drag)return;az-=(e.clientX-drag[0])*.005;el=Math.max(.1,Math.min(1.3,el+(e.clientY-drag[1])*.004));drag=[e.clientX,e.clientY];placeCam()});
 renderer.domElement.onwheel=e=>{e.preventDefault();dist=Math.max(5,Math.min(22,dist+e.deltaY*.01));placeCam()};
-const resize=()=>{const w=view.clientWidth,h=view.clientHeight;renderer.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix()};
+const resize=()=>{const w=view.clientWidth,h=view.clientHeight;renderer.setSize(w,h);cam.aspect=w/h;
+  // на узком экране (телефон) расширяем вертикальный угол, чтобы комната помещалась по ширине
+  cam.fov=Math.min(100,2*Math.atan(Math.tan(22.5*Math.PI/180)*Math.max(1,1.35/cam.aspect))*180/Math.PI);
+  cam.updateProjectionMatrix()};
 new ResizeObserver(resize).observe(view);resize();placeCam();
 
 scene.add(new THREE.HemisphereLight(0xffffff,0x887766,.9));
