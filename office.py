@@ -358,7 +358,13 @@ def shutdown():
     os._exit(0)
 
 class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # нужно для потока частями (chunked) через туннель
+
     def log_message(self, *a): pass
+
+    def chunk(self, data: bytes):
+        self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
 
     def is_local(self):
         """Запрос именно с этого компьютера, не через туннель/прокси."""
@@ -379,24 +385,24 @@ class H(BaseHTTPRequestHandler):
         route = self.path.partition("?")[0]
         if route == "/events":
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             q = queue.Queue()
             with lock: listeners.append(q)
             try:
-                self.wfile.write(b": hi\n\n")
+                self.chunk(b": hi " + b" " * 2048 + b"\n\n")  # «пробивает» буферы прокси
                 for k, v in activity.items():
                     q.put({"type": "activity", "agent": k, "active": v})
                 for k, tok in presence.items():
                     q.put({"type": "presence", "agent": k, "here": bool(tok), "token": tok or ""})
                 while True:
                     try:
-                        data = json.dumps(q.get(timeout=10))
-                        self.wfile.write(f"data: {data}\n\n".encode())
+                        self.chunk(f"data: {json.dumps(q.get(timeout=10))}\n\n".encode())
                     except queue.Empty:
-                        self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
+                        self.chunk(b": ping\n\n")
             except OSError:
                 pass
             finally:
