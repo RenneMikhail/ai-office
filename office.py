@@ -10,13 +10,20 @@ three.js, который подгружается с CDN (нужен интер�
 Остановка сервера (Ctrl+C или кнопка «Выключить офис») — сотрудники встают
 и уходят из комнаты.
 """
-import glob, json, os, secrets, queue, subprocess, sys, threading, time, urllib.request, webbrowser, re
+import glob, json, os, secrets, shutil, queue, subprocess, sys, threading, time, urllib.request, webbrowser, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8765
+PORT = int(os.environ.get("OFFICE_PORT", 8765))
 # Онлайн-доступ: смотреть можно по ссылке с ключом, управлять (задачи, выключение) — только с этого компьютера.
 TOKEN = os.environ.get("OFFICE_TOKEN") or secrets.token_urlsafe(12)
 DEMO = "--demo" in sys.argv
+# Кнопки с телефона: включаются флагом --control и требуют ВТОРОЙ ключ (ctl). Ссылка «только просмотр» кнопки не нажимает.
+# Выполняются только заранее написанные действия из списка ACTIONS ниже; свободный текст из интернета не принимается.
+CONTROL_ON = "--control" in sys.argv
+CONTROL = os.environ.get("OFFICE_CONTROL") or secrets.token_urlsafe(24)
+WORKDIR = os.path.expanduser("~/AI-Office-Work")  # сюда действия кладут файлы
+MIN_ACTION_GAP = 5  # секунд между нажатиями из интернета
+MEME_QUERY = "funny meme sound"  # что искать для кнопки «мемы» (YouTube через yt-dlp)
 
 # ---- Настройки сотрудников ---------------------------------------------------
 # Чтобы экономить токены Claude, ТЗ и итог пишет Qwen (локально, бесплатно),
@@ -90,6 +97,8 @@ listeners, lock, busy = [], threading.Lock(), threading.Event()
 event_log, event_cond = [], threading.Condition()  # для зрителей через туннель (SSE там не работает)
 event_seq = [0]
 
+last_remote = [0.0]
+
 def emit(**ev):
     with lock:
         for q in listeners:
@@ -129,6 +138,67 @@ def run_task(task):
             emit(type="done", agent=agent, text=prev)
             last = agent
         emit(type="final", agent=last, text=prev)
+    finally:
+        busy.clear()
+
+# ---- Готовые действия (кнопки) -------------------------------------------------
+# Каждое действие — обычная функция с фиксированными командами, без нейросетей и без текста от пользователя.
+def act_disk():
+    u = shutil.disk_usage("/System/Volumes/Data" if os.path.exists("/System/Volumes/Data") else "/")
+    return f"Свободно {u.free / 2**30:.0f} ГБ из {u.total / 2**30:.0f} ГБ (занято {u.used * 100 // u.total}%)"
+
+def act_load():
+    out = subprocess.run(["ps", "-Ao", "pcpu,rss,comm", "-r"], capture_output=True, text=True, timeout=10).stdout
+    rows = []
+    for line in out.splitlines()[1:6]:
+        cpu, rss, comm = line.split(None, 2)
+        rows.append(f"{os.path.basename(comm)}: {cpu}% CPU, {int(rss) // 1024} МБ")
+    return "Самые тяжёлые программы:\n" + "\n".join(rows)
+
+def act_files():
+    files = [p for p in glob.glob(os.path.join(WORKDIR, "**", "*"), recursive=True) if os.path.isfile(p)]
+    files.sort(key=os.path.getmtime, reverse=True)
+    if not files:
+        return f"Папка {WORKDIR} пока пуста"
+    lines = [f"{os.path.relpath(p, WORKDIR)}  ({os.path.getsize(p) // 1024} КБ)" for p in files[:10]]
+    return f"Последние файлы в {WORKDIR} (всего {len(files)}):\n" + "\n".join(lines)
+
+def act_memes():
+    ytdlp, ffmpeg = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp"), shutil.which("ffmpeg")
+    if not (os.path.exists(ytdlp) and ffmpeg):
+        raise RuntimeError("нужны yt-dlp и ffmpeg (brew install yt-dlp ffmpeg)")
+    out = os.path.join(WORKDIR, "memes-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(out, exist_ok=True)
+    # 10 коротких роликов (до 40 с) по поиску; звук сразу извлекается в mp3. Код 101 — «достигнут лимит», это успех.
+    r = subprocess.run([ytdlp, "-x", "--audio-format", "mp3", "--max-downloads", "10",
+                        "--match-filter", "duration<=40", "--no-warnings", "--ffmpeg-location", os.path.dirname(ffmpeg),
+                        "-o", os.path.join(out, "%(title).60s.%(ext)s"), f"ytsearch40:{MEME_QUERY}"],
+                       capture_output=True, text=True, timeout=1200)
+    got = sorted(os.listdir(out))
+    if not got and r.returncode not in (0, 101):
+        raise RuntimeError((r.stderr.strip() or "yt-dlp ничего не скачал")[-250:])
+    return f"Готово: {len(got)} mp3 в папке {out}\n" + "\n".join(got)
+
+# id -> (подпись кнопки, нужно ли подтверждение нажатия, функция)
+ACTIONS = {
+    "memes": ("🎧 10 мемов → звук (mp3)", True, act_memes),
+    "disk": ("💾 Место на диске", False, act_disk),
+    "load": ("🖥 Что грузит компьютер", False, act_load),
+    "files": ("📂 Что скачано", False, act_files),
+}
+
+def run_action(aid):
+    """Выполняет действие. В офисе его «запускает» менеджер Qwen (сам скрипт — обычная программа)."""
+    label, _, fn = ACTIONS[aid]
+    try:
+        emit(type="task", text="🔘 " + label)
+        emit(type="working", agent="qwen")
+        try:
+            result = fn() if not DEMO else f"[демо] {label}"
+        except Exception as e:
+            emit(type="error", agent="qwen", text=str(e)[:200])
+            return
+        emit(type="done", agent="qwen", text=result)
     finally:
         busy.clear()
 
@@ -505,6 +575,14 @@ class H(BaseHTTPRequestHandler):
         return (self.client_address[0] in ("127.0.0.1", "::1") and not proxied
                 and h.get("Host", "").split(":")[0] in ("localhost", "127.0.0.1"))
 
+    def qs(self):
+        q = self.path.partition("?")[2]
+        return dict(p.partition("=")[::2] for p in q.split("&") if p)
+
+    def control_ok(self):
+        """Кнопки из интернета: сервер запущен с --control, верны ключ просмотра И ключ управления."""
+        return CONTROL_ON and self.allowed() and secrets.compare_digest(self.qs().get("ctl", ""), CONTROL)
+
     def allowed(self):
         if self.is_local():
             return True
@@ -547,6 +625,9 @@ class H(BaseHTTPRequestHandler):
             except ValueError:
                 since = -1
             self.reply(200, json.dumps(poll(since)), "application/json")
+        elif route == "/actions":
+            self.reply(200, json.dumps([{"id": k, "label": v[0], "confirm": v[1]} for k, v in ACTIONS.items()]),
+                       "application/json")
         elif route == "/agents":
             self.reply(200, json.dumps({k: {"name": v["name"], "role": v["role"]}
                                         for k, v in AGENTS.items()}), "application/json")
@@ -554,10 +635,26 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, PAGE, "text/html; charset=utf-8")
 
     def do_POST(self):
-        if not self.is_local():  # из интернета — только просмотр
-            return self.reply(403, "только просмотр")
+        local, route = self.is_local(), self.path.partition("?")[0]
+        if not local and not (route == "/action" and self.control_ok()):
+            return self.reply(403, "только просмотр")  # из интернета разрешены только кнопки из списка
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) or b"{}"
+        if route == "/action":
+            aid = json.loads(raw).get("id")
+            if aid not in ACTIONS:
+                return self.reply(404, "нет такого действия")
+            if not local:
+                now = time.time()
+                if now - last_remote[0] < MIN_ACTION_GAP:
+                    return self.reply(429, "слишком часто")
+                last_remote[0] = now
+            if busy.is_set():
+                return self.reply(409, "busy")
+            busy.set()
+            print(f"[кнопка {'на компьютере' if local else 'с телефона'}] {ACTIONS[aid][0]}", flush=True)
+            threading.Thread(target=run_action, args=(aid,), daemon=True).start()
+            return self.reply(200, "started")
         if self.path == "/quit":
             self.reply(200, "bye")
             threading.Thread(target=shutdown, daemon=True).start()
@@ -601,10 +698,13 @@ button:disabled{opacity:.5}
 .bubble.think{border-radius:26px;font-style:italic;font-weight:500}
 #banner{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
  font-size:28px;font-weight:700;background:rgba(20,22,30,.55);pointer-events:none;text-align:center}
+#actions{display:flex;flex-wrap:wrap;gap:8px;padding:0 10px 8px}
+#actions button{padding:12px 14px;font-size:15px;background:#3d6fe0;color:#fff}
 #hint{position:absolute;right:12px;top:8px;font-size:12px;opacity:.7}
 </style>
 <div id="bar"><input id="task" placeholder="Дайте задачу команде, например: напиши короткое поздравление с днём рождения коллеге">
 <button id="go">Отправить</button><button id="off">Выключить офис</button></div>
+<div id="actions"></div>
 <div id="view"><div id="banner">Офис закрыт — программа выключена.<br>Запустите office.py снова.</div>
 <div id="hint">тяните мышью — вращать, колесо — приблизить</div></div>
 <div id="log"></div>
@@ -614,9 +714,11 @@ import * as THREE from 'three';
 const KEY=new URLSearchParams(location.search).get('key');
 const Q=KEY?'?key='+encodeURIComponent(KEY):'';
 const VIEWER=!['localhost','127.0.0.1'].includes(location.hostname);
+const CTL=new URLSearchParams(location.search).get('ctl');
+const QS=(KEY?'key='+encodeURIComponent(KEY):'')+(CTL?'&ctl='+encodeURIComponent(CTL):'');
 if(VIEWER){const bar=document.getElementById('bar');[...bar.children].forEach(c=>c.style.display='none');
   const n=document.createElement('div');n.style.cssText='padding:6px 4px;opacity:.85';
-  n.textContent='👁 Режим просмотра — офис работает на компьютере владельца';bar.appendChild(n)}
+  n.textContent=CTL?'🔘 Кнопки управления — действия выполняются на компьютере владельца':'👁 Режим просмотра — офис работает на компьютере владельца';bar.appendChild(n)}
 const names=await fetch('/agents'+Q).then(r=>r.json());
 const order=['claude_app','claude','qwen','deepseek'];
 const COL={claude_app:0xf0b27a,claude:0xd97757,qwen:0x6c5ce7,deepseek:0x2e86de};
@@ -847,12 +949,23 @@ function sync(id,delay=0){const p=P[id],want=conn&&p.here;
   else if(!want&&p.in){p.in=false;leave(p,delay)}}
 function syncAll(){order.forEach((id,i)=>sync(id,i*900));
   setTimeout(()=>{$('banner').style.display=(!conn)?'flex':'none'},conn?0:4500)}
+// кнопки готовых действий: на самом компьютере и по ссылке с ключом управления
+if(!VIEWER||CTL){fetch('/actions'+Q).then(r=>r.json()).then(list=>{const box=document.getElementById('actions');
+  for(const a of list){const b=document.createElement('button');b.textContent=a.label;
+    b.onclick=async()=>{if(a.confirm&&!confirm('Запустить на компьютере: '+a.label+'?'))return;
+      const r=await fetch('/action'+(QS?'?'+QS:''),{method:'POST',body:JSON.stringify({id:a.id})});
+      if(r.status===409)log('Офис сейчас занят другим действием — подождите');
+      else if(r.status===429)log('Слишком часто — подождите несколько секунд');
+      else if(r.status===403)log('Управление выключено: запустите office.py с флагом --control');
+      else if(!r.ok)log('Не удалось запустить ('+r.status+')')};
+    box.appendChild(b)}}).catch(()=>{})}
 function onOpen(){conn=true;$('banner').style.display='none';syncAll()}
 function onLost(){if(!conn)return;conn=false;q.length=0;$('go').disabled=false;syncAll()}
 function onEvent(e){
   if(e.type==='leave'){conn=false;q.length=0;syncAll()}
   else if(e.type==='activity')P[e.agent].ext=e.active;
   else if(e.type==='detail')P[e.agent].detail=e.text;
+  else if(e.type==='task')log(e.text);
   else if(e.type==='presence'){const p=P[e.agent],restart=p.here&&e.here&&p.tok!==e.token&&p.in;
     p.here=e.here;p.tok=e.token;
     if(restart){log('Перезапуск: '+names[e.agent].name);p.in=false;leave(p,0).then(()=>{if(conn&&p.here&&!p.in){p.in=true;p.pw=false;enter(p,500)}})}
@@ -904,6 +1017,9 @@ def share():
         m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
         if m:
             print(f"\nСсылка для просмотра онлайн (только просмотр):\n  {m.group(0)}/?key={TOKEN}\n", flush=True)
+            if CONTROL_ON:
+                print("Ссылка с КНОПКАМИ (с неё с телефона запускаются готовые действия; держите в секрете):\n"
+                      f"  {m.group(0)}/?key={TOKEN}&ctl={CONTROL}\n", flush=True)
             break
     for _ in p.stderr:  # держим трубу открытой, пока жив процесс
         pass
