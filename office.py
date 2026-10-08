@@ -468,7 +468,9 @@ import * as THREE from 'three';
 const KEY=new URLSearchParams(location.search).get('key');
 const Q=KEY?'?key='+encodeURIComponent(KEY):'';
 const VIEWER=!['localhost','127.0.0.1'].includes(location.hostname);
-if(VIEWER){document.getElementById('bar').innerHTML='<div style="padding:6px 4px;opacity:.85">👁 Режим просмотра — офис работает на компьютере владельца</div>'}
+if(VIEWER){const bar=document.getElementById('bar');[...bar.children].forEach(c=>c.style.display='none');
+  const n=document.createElement('div');n.style.cssText='padding:6px 4px;opacity:.85';
+  n.textContent='👁 Режим просмотра — офис работает на компьютере владельца';bar.appendChild(n)}
 const names=await fetch('/agents'+Q).then(r=>r.json());
 const order=['claude_app','claude','qwen','deepseek'];
 const COL={claude_app:0xf0b27a,claude:0xd97757,qwen:0x6c5ce7,deepseek:0x2e86de};
